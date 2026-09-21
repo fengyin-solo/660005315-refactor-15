@@ -1,9 +1,9 @@
 import asyncio, math, random, time, json, threading
-from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import numpy as np
+
+from .anomaly import AnomalyEngine
 
 app = FastAPI(title="Digital Twin Factory Monitor")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -12,6 +12,7 @@ DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCSta
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+EVENT_LOOP = None  # 启动时捕获的主事件循环，供模拟器线程跨线程推送 WebSocket
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -41,38 +42,10 @@ devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
                           random.uniform(-5, 5), 0.5, random.uniform(-5, 5)) for i in range(1, 13)}
 
 production_log = []
-anomaly_log = []
 
-class AnomalyRules:
-    def __init__(self):
-        self.rules = [
-            {"name": "高温告警", "field": "temperature", "threshold": 48, "op": "gt"},
-            {"name": "振动超标", "field": "vibration", "threshold": 2.0, "op": "gt"},
-            {"name": "压力异常", "field": "pressure", "threshold": 1.5, "op": "gt"},
-        ]
-        self.windows = defaultdict(lambda: deque(maxlen=10))
-
-    def check(self, dev: DeviceState):
-        triggers = []
-        for rule in self.rules:
-            val = getattr(dev, rule["field"])
-            if (rule["op"] == "gt" and val > rule["threshold"]) or (rule["op"] == "lt" and val < rule["threshold"]):
-                triggers.append({"device_id": dev.id, "rule": rule["name"],
-                                 "value": round(val, 3), "threshold": rule["threshold"]})
-
-        # sliding window trend
-        key = f"{dev.id}_temp"
-        self.windows[key].append(dev.temperature)
-        if len(self.windows[key]) >= 8:
-            vals = list(self.windows[key])
-            if np.mean(vals[-4:]) - np.mean(vals[:4]) > 3:
-                triggers.append({"device_id": dev.id, "rule": "温度趋势上升", "value": round(np.mean(vals[-4:]), 2), "threshold": ">3°C/周期"})
-
-        if triggers:
-            anomaly_log.append({"timestamp": time.time(), "triggers": triggers, "device_type": dev.type})
-        return triggers
-
-rules_engine = AnomalyRules()
+# 模拟与上报两段流程共用的异常检测引擎：阈值校验、连续超限周期累计、
+# 温度走势上升判断的唯一实现都在 app.anomaly 中。
+rules_engine = AnomalyEngine()
 
 def simulate():
     while SIMULATOR_RUNNING:
@@ -97,7 +70,7 @@ def simulate():
                     dev.production_count += 1
                 dev.uptime += 1
 
-            triggers = rules_engine.check(dev)
+            triggers = rules_engine.evaluate(dev)
             if triggers and dev.status != "FAULT" and random.random() < 0.3:
                 dev.status = "FAULT"
 
@@ -107,7 +80,7 @@ def simulate():
             payload = {
                 "devices": [d.to_dict() for d in devices.values()],
                 "production": sum(d.production_count for d in devices.values()),
-                "anomalies": anomaly_log[-5:] if anomaly_log else [],
+                "anomalies": rules_engine.recent(5),
                 "oee": calculate_oee()
             }
             msg = json.dumps(payload)
@@ -117,7 +90,7 @@ def simulate():
         dead = []
         for ws in ACTIVE_CLIENTS:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
+                asyncio.run_coroutine_threadsafe(ws.send_text(msg), EVENT_LOOP)
             except:
                 dead.append(ws)
         for ws in dead:
@@ -151,13 +124,15 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global EVENT_LOOP
+    EVENT_LOOP = asyncio.get_running_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
 
 @app.get("/api/devices")
 def get_devices():
-    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": anomaly_log[-10:]}
+    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": rules_engine.recent(10)}
 
 
 @app.get("/api/oee")
