@@ -1,9 +1,9 @@
 import asyncio, math, random, time, json, threading
-from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import numpy as np
+
+from .anomaly_rules import rules_engine
 
 app = FastAPI(title="Digital Twin Factory Monitor")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,38 +41,6 @@ devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
                           random.uniform(-5, 5), 0.5, random.uniform(-5, 5)) for i in range(1, 13)}
 
 production_log = []
-anomaly_log = []
-
-class AnomalyRules:
-    def __init__(self):
-        self.rules = [
-            {"name": "高温告警", "field": "temperature", "threshold": 48, "op": "gt"},
-            {"name": "振动超标", "field": "vibration", "threshold": 2.0, "op": "gt"},
-            {"name": "压力异常", "field": "pressure", "threshold": 1.5, "op": "gt"},
-        ]
-        self.windows = defaultdict(lambda: deque(maxlen=10))
-
-    def check(self, dev: DeviceState):
-        triggers = []
-        for rule in self.rules:
-            val = getattr(dev, rule["field"])
-            if (rule["op"] == "gt" and val > rule["threshold"]) or (rule["op"] == "lt" and val < rule["threshold"]):
-                triggers.append({"device_id": dev.id, "rule": rule["name"],
-                                 "value": round(val, 3), "threshold": rule["threshold"]})
-
-        # sliding window trend
-        key = f"{dev.id}_temp"
-        self.windows[key].append(dev.temperature)
-        if len(self.windows[key]) >= 8:
-            vals = list(self.windows[key])
-            if np.mean(vals[-4:]) - np.mean(vals[:4]) > 3:
-                triggers.append({"device_id": dev.id, "rule": "温度趋势上升", "value": round(np.mean(vals[-4:]), 2), "threshold": ">3°C/周期"})
-
-        if triggers:
-            anomaly_log.append({"timestamp": time.time(), "triggers": triggers, "device_type": dev.type})
-        return triggers
-
-rules_engine = AnomalyRules()
 
 def simulate():
     while SIMULATOR_RUNNING:
@@ -107,7 +75,7 @@ def simulate():
             payload = {
                 "devices": [d.to_dict() for d in devices.values()],
                 "production": sum(d.production_count for d in devices.values()),
-                "anomalies": anomaly_log[-5:] if anomaly_log else [],
+                "anomalies": rules_engine.recent(5),
                 "oee": calculate_oee()
             }
             msg = json.dumps(payload)
@@ -157,7 +125,7 @@ async def startup():
 
 @app.get("/api/devices")
 def get_devices():
-    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": anomaly_log[-10:]}
+    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": rules_engine.recent(10)}
 
 
 @app.get("/api/oee")
